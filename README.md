@@ -5,7 +5,7 @@ This repository contains code for our KI2025 paper "Deep learning emulators for 
 
 ## Dataset
  
-The dataset can be downloaded at this link: **TODO**
+The dataset can be downloaded from Zenodo: https://doi.org/10.5281/zenodo.17098296
 
 ## Installation
 Please create a new virtual environment using Python 3.8 and install the required packages using the following command: 
