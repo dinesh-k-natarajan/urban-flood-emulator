@@ -1,0 +1,214 @@
+from typing import List, Tuple, Dict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .concatenation import ConcatenationFusion
+
+DEVICE = torch.device('cuda:0')
+
+## Define 1 conv operation for skip convolutions
+class simple_conv(nn.Module):
+    def __init__(self, ch_in, ch_out) -> None:
+        super(simple_conv,self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(ch_in, ch_out, kernel_size=3,stride=1,padding=1,bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.LeakyReLU(negative_slope=0.02),
+        )
+    
+    def forward(self,x):
+        x = self.conv(x)
+        return x
+
+## Define typical double convolution block
+class conv_block(nn.Module):
+    def __init__(self,ch_in,ch_out):
+        super(conv_block,self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(ch_in, ch_out, kernel_size=3,stride=1,padding=1,bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.LeakyReLU(negative_slope=0.02),
+            nn.Conv2d(ch_out, ch_out, kernel_size=3,stride=1,padding=1,bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.LeakyReLU(negative_slope=0.02),
+        )
+
+    def forward(self,x):
+        x = self.conv(x)
+        return x
+
+
+class DecoderLayer_bottleneck(nn.Module):
+    def __init__(self, in_channels_concat: int, in_channels_up: int, out_channels: int) -> None:
+        super(DecoderLayer_bottleneck, self).__init__()
+
+        self.transpose = nn.ConvTranspose2d(in_channels_up, out_channels, 2, 2, bias=True)
+        self.conv = conv_block(in_channels_concat, out_channels)
+
+    def forward(self, skip_x: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x = self.transpose(x)
+        x = torch.cat((skip_x, x), dim=1)
+        return self.conv(x)
+
+class DecoderLayer(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super(DecoderLayer, self).__init__()
+
+        self.transpose = nn.ConvTranspose2d(in_channels, out_channels, 2, 2, bias=True)
+        self.conv = conv_block(in_channels, out_channels)
+
+    def forward(self, skip_x: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x = self.transpose(x)
+        x = torch.cat((skip_x, x), dim=1)
+        return self.conv(x)
+
+
+class UNet_SC_Large(nn.Module):
+    def __init__(self, n_input_channels:int=1,
+                fusion_module: str = 'ConcatenationFusion',
+                device=torch.device('cuda:0')
+            ) -> None:
+        super(UNet_SC_Large, self).__init__()
+        
+        ##Pooling operation
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        ## Encoder 1: DEM operations in linear format
+        self.enc1 = conv_block(ch_in=n_input_channels,ch_out=16)
+        self.enc2 = conv_block(ch_in=16,ch_out=32)
+        self.enc3 = conv_block(ch_in=32,ch_out=64)
+        self.enc4 = conv_block(ch_in=64,ch_out=128)
+        self.enc5 = conv_block(ch_in=128, ch_out=256)
+        self.enc6 = conv_block(ch_in=256, ch_out=512)
+
+        # Encoder 2: Rain
+        self.rain_encoder = nn.Sequential(
+            nn.Linear(in_features=36, out_features=24),
+            nn.LeakyReLU(negative_slope=0.02),
+            nn.Linear(in_features=24, out_features=12),
+            nn.LeakyReLU(negative_slope=0.02),
+            nn.Linear(in_features=12, out_features=8),
+            nn.LeakyReLU(negative_slope=0.02),
+        )
+
+        ##Fusion Module: DEM & rain
+        self.fusion = ConcatenationFusion()
+        fused_channels = self.fusion.get_fused_channels(dem_channels=512, rain_channels=8)
+
+        #Decoder operations
+        self.decode6 = DecoderLayer_bottleneck(in_channels_concat=1024, in_channels_up=fused_channels, out_channels=512)
+        self.decode5 = DecoderLayer(in_channels=512, out_channels=256)
+        self.decode4 = DecoderLayer(in_channels=256, out_channels=128)
+        self.decode3 = DecoderLayer(in_channels=128, out_channels=64)
+        self.decode2 = DecoderLayer(in_channels=64, out_channels=32)
+        self.decode1 = DecoderLayer(in_channels=32, out_channels=16)
+
+        ##### SKIP CONVOLUTION OPERATIONS #####
+        self.skip31 = simple_conv(ch_in=64, ch_out=64) # for enc32: 32 out channels
+        self.skip321 = simple_conv(ch_in=64, ch_out=64) # for skip41: 32 out channels
+        self.skip322 = simple_conv(ch_in=64, ch_out=64) # for skip41: 32 out channels
+        self.skip331 = simple_conv(ch_in=128, ch_out=64) # input is the concat of output of skip421, skip422
+        self.skip332 = conv_block(ch_in=128, ch_out=64) # input is the concat of output of skip421, skip422
+        self.skip34 = simple_conv(ch_in=128, ch_out=64) # input is the concat of output of skip431, skip432
+
+        self.skip21 = simple_conv(ch_in=32, ch_out=32) # for enc22: 16 out channels
+        self.skip221 = simple_conv(ch_in=32, ch_out=32) # for skip51: 16 out channels
+        self.skip222 = simple_conv(ch_in=32, ch_out=32) # for skip51: 16 out channels
+        self.skip231 = simple_conv(ch_in=64, ch_out=32) # input is the concat of output of skip521, skip522
+        self.skip232 = conv_block(ch_in=64, ch_out=32) # input is the concat of output of skip521, skip522
+        self.skip24 = simple_conv(ch_in=64, ch_out=32) # input is the concat of output of skip531, skip532
+        
+        self.skip11 = simple_conv(ch_in=16, ch_out=16) # for enc12: 8 out channels
+        self.skip121 = simple_conv(ch_in=16, ch_out=16) # for skip61: 16 out channels
+        self.skip122 = simple_conv(ch_in=16, ch_out=16) # for skip61: 16 out channels
+        self.skip131 = simple_conv(ch_in=32, ch_out=16) # input is the concat of output of skip621, skip622
+        self.skip132 = conv_block(ch_in=32, ch_out=16) # input is the concat of output of skip621, skip622
+        self.skip14 = simple_conv(ch_in=32, ch_out=16)# input is the concat of output of skip631, skip632
+
+        ##self.outputlayer = nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, stride=1, padding=1, bias=True)
+
+        self.outputlayer = nn.Sequential(
+            nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, dem: torch.Tensor, rain: torch.Tensor) -> Dict[str, torch.Tensor]:
+
+        enc1 = self.enc1(dem)
+        encP1 = self.pool(enc1)
+
+        enc2 = self.enc2(encP1)
+        encP2 = self.pool(enc2)
+
+        enc3 = self.enc3(encP2)
+        encP3 = self.pool(enc3)
+
+        enc4 = self.enc4(encP3)
+        encP4 = self.pool(enc4)
+
+        enc5 = self.enc5(encP4)
+        encP5 = self.pool(enc5)
+        
+        enc6 = self.enc6(encP5)
+        encP6 = self.pool(enc6)
+
+        # Rain encoding
+        enc_rain   = self.rain_encoder(rain)
+        #print(f"öööö Encoded features shape: enc_dem = {encP6.shape}, enc_rain = {enc_rain.shape}")
+        fused = self.fusion(encP6, enc_rain)
+        
+        dec5 = self.decode6(enc6,fused)
+        dec4 = self.decode5(enc5,dec5)
+        dec3 = self.decode4(enc4, dec4)
+        
+        ## Skip convolutions
+        enc3_skip31 = self.skip31(enc3) # 32 out_channels
+        enc3_skip321 = self.skip321(enc3_skip31) # 32 out_channels
+        enc3_skip322 = self.skip322(enc3_skip31) # 32 out_channels
+        enc3_skip32cat = torch.cat([enc3_skip321, enc3_skip322], dim=1) # 64 out_channels
+        enc3_skip331 = self.skip331(enc3_skip32cat) # 32 out_channels
+        enc3_skip332 = self.skip332(enc3_skip32cat) # 32 out_channels
+        enc3_skip33cat = torch.cat([enc3_skip331, enc3_skip332], dim=1) # 64 out_channels
+        enc3_skip34 = self.skip34(enc3_skip33cat) # 32 out_channels
+
+        ## Upsampling and concatenation
+        dec2 = self.decode3(enc3_skip34, dec3)
+
+        ## Skip Convolutions
+        enc2_skip21 = self.skip21(enc2) # 16 out_channels
+        enc2_skip221 = self.skip221(enc2_skip21) # 16 out_channels
+        enc2_skip222 = self.skip222(enc2_skip21) # 16 out_channels
+        enc2_skip22cat = torch.cat([enc2_skip221, enc2_skip222], dim=1) # 32 out_channels
+        enc2_skip231 = self.skip231(enc2_skip22cat) # 16 out_channels
+        enc2_skip232 = self.skip232(enc2_skip22cat) # 16 out_channels
+        enc2_skip23cat = torch.cat([enc2_skip231, enc2_skip232], dim=1) # 32 out_channels
+        enc2_skip24 = self.skip24(enc2_skip23cat) # 16 out_channels
+        
+        ## Upsampling and concatenation
+        dec1 = self.decode2(enc2_skip24, dec2)
+
+        ## Skip convolutions
+        enc1_skip11 = self.skip11(enc1) # 8 out_channels
+        enc1_skip121 = self.skip121(enc1_skip11) # 8 out_channels
+        enc1_skip122 = self.skip122(enc1_skip11) # 8 out_channels
+        enc1_skip12cat = torch.cat([enc1_skip121, enc1_skip122], dim=1) # 16 out_channels
+        enc1_skip131 = self.skip131(enc1_skip12cat) # 8 out_channels
+        enc1_skip132 = self.skip132(enc1_skip12cat) # 8 out_channels
+        enc1_skip13cat = torch.cat([enc1_skip131, enc1_skip132], dim=1) # 16 out_channels
+        enc1_skip14 = self.skip14(enc1_skip13cat) # 8 out_channels
+
+        ## Upsampling and concatenation
+        op = self.decode1(enc1_skip14, dec1)
+
+        output = self.outputlayer(op)
+
+        return {
+            'water_depth': output, 
+        }
+
+def main():
+    arch = UNet_SC_Large()
+    
+if __name__ == '__main__':
+    main()

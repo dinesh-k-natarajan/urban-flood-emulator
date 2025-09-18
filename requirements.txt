@@ -1,0 +1,10 @@
+numpy==1.24.4
+pandas==1.5.3
+pytorch-lightning==2.2.0
+PyYAML==6.0.1
+rasterio==1.3.9
+richdem==0.3.4
+tifffile
+timm==1.0.19
+torch==2.2.0
+torchmetrics==1.3.1

@@ -1,0 +1,15 @@
+# Architecture config
+DATASET_NAME: "FloodDataset" # Make sure it matches the name of the Dataset class
+ARCH_NAME: "UNetTransformer_Large" # Make sure it matches the name of Architecture class
+MODEL_NAME: "RegressionModel" # Make sure it matches one of the Model classes [RegressionModel, MaskedRegressionModel]
+FUSION_NAME: "ConcatenationFusion" # Make sure it matches the name of Fusion class
+# Dataloader config
+BATCH_SIZE: 2
+ACC_GRAD: 16
+NUM_WORKERS: 2 # No. of CPU subprocesses used for dataloading, 0 = using the main process
+# Training config
+EPOCHS: 500
+LEARNING_RATE: 0.001
+NUM_GPUS: 1
+PRECISION: 32 # Floating point precision
+OPTIMIZER: 'AdamW' # Make sure it is the name of optimizer classes in torch.optim
